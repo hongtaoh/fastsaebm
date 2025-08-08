@@ -1,6 +1,6 @@
-# `pysaebm`
+# `fastsaebm`
 
-`pysaebm` is a Python package for generating and analyzing biomarker data using Stage-Aware Event-Based Modeling (SA-EBM). It supports various data generation experiments and EBM algorithms to estimate biomarker orderings and disease stages. This package is designed for researchers and data scientists working with biomarker progression analysis.
+`fastsaebm` is a Python package for generating and analyzing biomarker data using Stage-Aware Event-Based Modeling (SA-EBM). It supports various data generation experiments and EBM algorithms to estimate biomarker orderings and disease stages. This package is designed for researchers and data scientists working with biomarker progression analysis.
 
 For detailed methodology, refer to [our paper](https://saebm.hongtaoh.com/).
 
@@ -315,7 +315,7 @@ The data should be in a [tidy format](https://vita.had.co.nz/papers/tidy-data.pd
 
 ## Change Log
 
-- 2025-08-03 (V 0.0.5)
+- 2025-08-03 (V 0.0.6)
     - Implemented the numpy version.
     - Implemented numba in functions.
 

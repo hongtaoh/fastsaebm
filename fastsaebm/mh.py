@@ -11,12 +11,12 @@ def metropolis_hastings(
         n_shuffle: int,
         prior_n: float,
         prior_v: float,
-        bw_method:str,
         rng: np.random.Generator
 ) -> Tuple:
     """
     
     """
+
     n_participants, n_biomarkers = data_matrix.shape
 
     # Validate input
@@ -37,6 +37,7 @@ def metropolis_hastings(
             data_matrix=data_matrix, diseased_ids=diseased_ids, 
             non_diseased_ids=non_diseased_ids, rng=rng
         )
+
     else:
         # N * 4 matrix, cols: theta_mean, theta_std, phi_mean, phi_std
         theta_phi_default = utils.get_initial_theta_phi_estimates(
@@ -87,7 +88,7 @@ def metropolis_hastings(
             if algorithm == 'kde':
                 _, stage_post_old = utils.compute_total_ln_likelihood_and_stage_likelihoods_kde(
                     n_participants, data_matrix, new_order, non_diseased_ids, 
-                    current_theta_phi, current_pi, disease_stages, bw_method
+                    current_theta_phi, current_pi, disease_stages
                 )
             else:
                 _, stage_post_old = utils.compute_total_ln_likelihood_and_stage_likelihoods(
@@ -128,7 +129,7 @@ def metropolis_hastings(
             # Recompute new_ln_likelihood using the new theta_phi_estimates
             if algorithm == 'kde':
                 new_ln_likelihood, stage_post_new = utils.compute_total_ln_likelihood_and_stage_likelihoods_kde(
-                    n_participants, data_matrix, new_order, non_diseased_ids, new_theta_phi, current_pi, disease_stages, bw_method
+                    n_participants, data_matrix, new_order, non_diseased_ids, new_theta_phi, current_pi, disease_stages
                 )
             else:
                 new_ln_likelihood, stage_post_new = utils.compute_total_ln_likelihood_and_stage_likelihoods(
@@ -154,7 +155,7 @@ def metropolis_hastings(
 
             stage_counts = np.zeros(n_disease_stages)
             # participant, array of stage likelihoods
-            for p in range(n_participants):
+            for p in diseased_ids:
                 stage_probs = stage_post_new[p]
                 stage_counts += stage_probs  # Soft counts
             current_pi = rng.dirichlet(alpha_prior + stage_counts)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastsaebm"
-version = "0.0.5"
+version = "0.7.0"
 description = "Stage-Aware Event-Based Modeling for Disease Progression"
 readme = "README.md"
 authors = [

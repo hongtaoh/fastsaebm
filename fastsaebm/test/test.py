@@ -12,7 +12,7 @@ OUTPUT_DIR = 'algo_results'
 with open(f"{cwd}/fastsaebm/test/true_order_and_stages.json", "r") as f:
     true_order_and_stages = json.load(f)
 
-for algorithm in ['conjugate_priors']:
+for algorithm in ['mle']:
     for data_file in data_files:
         fname = data_file.replace('.csv', '')
         true_order_dict = true_order_and_stages[fname]['true_order']
@@ -21,9 +21,9 @@ for algorithm in ['conjugate_priors']:
             algorithm=algorithm,
             data_file= os.path.join(data_dir, data_file),
             output_dir=OUTPUT_DIR,
-            n_iter=2000,
+            n_iter=3000,
             n_shuffle=2,
-            burn_in=200,
+            burn_in=100,
             thinning=1,
             true_order_dict=true_order_dict,
             true_stages = true_stages,

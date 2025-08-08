@@ -11,6 +11,7 @@ from sklearn.metrics import mean_absolute_error
 # Import utility functions
 from .utils import (setup_logging, 
                    extract_fname, 
+                   shuffle_order,
                    cleanup_old_files, 
                    compute_unbiased_stage_likelihoods, 
                    compute_unbiased_stage_likelihoods_kde)
@@ -37,7 +38,6 @@ def run_ebm(
     prior_n: float = 1.0,
     # Prior degrees of freedom, influencing the certainty of prior estimate of the variance (σ²), set to 1 as default
     prior_v: float = 1.0,
-    bw_method:str='scott',
     seed: int = 123,
 ) -> Dict[str, Union[str, int, float, Dict, List]]:
     """
@@ -62,7 +62,6 @@ def run_ebm(
         skip_traceplot (Optional[bool]): whether to save traceplots. True if you want to skip saving traceplots and save space.
         prior_n (strength of belief in prior of mean): default to be 1.0
         prior_v (prior degree of freedom) are the weakly informative priors, default to be 1.0
-        bw_method (str): bandwidth selection method in kde
         seed (int): for reproducibility
 
     Returns:
@@ -128,17 +127,38 @@ def run_ebm(
     n_participants = len(data.participant.unique())
 
     df = data.copy()
-    diseased_dict = dict(zip(df.participant, df.diseased))
-    dff = df.pivot(
-        index='participant', columns='biomarker', values='measurement')
-    # make sure the data_matrix is in this order
-    dff = dff.reindex(columns=biomarker_names, level=1) 
-    # remove column name (biomarker) to clean display
-    dff.columns.name = None      
-    # bring 'participant' back as a column and then delete it
-    dff.reset_index(inplace=True, drop=True)  
+
+    # 1) Pivot so that rows are participants
+    dff = data.pivot(
+        index='participant',
+        columns='biomarker',
+        values='measurement'
+    )
+
+    # 2) Build diseased_arr from the true index
+    diseased_dict = dict(zip(data.participant, data.diseased))
+    diseased_arr  = dff.index.map(diseased_dict).to_numpy(dtype=int)
+
+    # 3) Reorder biomarker columns if needed
+    dff = dff[biomarker_names]   # no need for level=1 here
+
+    # 4) Reset to plain RangeIndex & extract matrix
+    dff.reset_index(drop=True, inplace=True)
     data_matrix = dff.to_numpy()
-    diseased_arr = np.array([int(diseased_dict[x]) for x in range(n_participants)])
+
+    # diseased_dict = dict(zip(df.participant, df.diseased))
+    # dff = df.pivot(
+    #     index='participant', columns='biomarker', values='measurement')
+    # dff['diseased'] = dff.index.map(diseased_dict)
+    # diseased_arr    = dff['diseased'].to_numpy(dtype=int)
+    # dff.drop(columns='diseased', inplace=True)
+    # # make sure the data_matrix is in this order
+    # dff = dff.reindex(columns=biomarker_names, level=1) 
+    # # remove column name (biomarker) to clean display
+    # dff.columns.name = None      
+    # # bring 'participant' back as a column and then delete it
+    # dff.reset_index(inplace=True, drop=True)  
+    # data_matrix = dff.to_numpy()
 
     non_diseased_ids = np.where(diseased_arr == 0)[0]
     healthy_ratio = len(non_diseased_ids)/n_participants
@@ -147,7 +167,7 @@ def run_ebm(
     try:
         accepted_orders, log_likelihoods, final_theta_phi, final_stage_post, current_pi = metropolis_hastings(
             algorithm=algorithm, data_matrix=data_matrix, diseased_arr=diseased_arr, iterations = n_iter, 
-            n_shuffle = n_shuffle,  prior_n=prior_n, prior_v=prior_v, bw_method=bw_method, rng=rng
+            n_shuffle = n_shuffle,  prior_n=prior_n, prior_v=prior_v, rng=rng
         )
     except Exception as e:
         logging.error(f"Error in Metropolis-Hastings algorithm: {e}")
@@ -156,13 +176,66 @@ def run_ebm(
     # Get the order associated with the highet log likelihoods
     order_with_highest_ll = accepted_orders[log_likelihoods.index(max(log_likelihoods))]
 
+    def rmj_distance(central: np.ndarray, ranking: np.ndarray) -> int:
+        pos_central = {item: idx for idx, item in enumerate(central)}
+        distance = 0
+        for i in range(len(ranking) - 1):
+            a, b = ranking[i], ranking[i + 1]
+            if pos_central[a] > pos_central[b]:
+                distance += (len(central) - i - 1)
+        return distance
+    
+    def estimate_central_ranking(accepted_orders, order_with_highest_ll):
+        current_order = order_with_highest_ll
+        current_score = sum(kendalltau(current_order, o)[0] for o in accepted_orders)
+        for _ in range(n_iter):
+            try:
+                new_order = current_order.copy()
+                shuffle_order(new_order, n_shuffle, rng)
+                new_score = sum(kendalltau(new_order, o)[0] for o in accepted_orders)
+                if new_score > current_score or np.random.rand() < np.exp(min(new_score - current_order, 700)):
+                    current_order = new_order
+                    current_score = new_score
+                # else:
+                #     if new_score < current_score:
+                #         current_order = new_order
+                #         current_score = new_score
+            except ValueError:
+                break
+        return current_order
+    
+
+    # def estimate_central_ranking(accepted_orders, order_with_highest_ll):
+    #     current_order = order_with_highest_ll
+    #     current_score = sum(rmj_distance(current_order, o) for o in accepted_orders)
+    #     for _ in range(n_iter):
+    #         try:
+    #             new_order = current_order.copy()
+    #             shuffle_order(new_order, n_shuffle, rng)
+    #             new_score = sum(rmj_distance(new_order, o) for o in accepted_orders)
+    #             if new_score < current_score or np.random.rand() < np.exp(current_score - new_score):
+    #                 current_order = new_order
+    #                 current_score = new_score
+    #             # else:
+    #             #     if new_score < current_score:
+    #             #         current_order = new_order
+    #             #         current_score = new_score
+    #         except ValueError:
+    #             break
+    #     return current_order
+    
+    ml_order = estimate_central_ranking(accepted_orders, order_with_highest_ll)
+
     if true_order_dict:
         # Sort both dicts by the key to make sure they are comparable
         true_order_dict = dict(sorted(true_order_dict.items()))
         tau, p_value = kendalltau(order_with_highest_ll, list(true_order_dict.values()))
+        tau2, p_value2 = kendalltau(ml_order, list(true_order_dict.values()))
     else:
         tau, p_value = None, None
+        tau2, p_value2 = None, None
 
+    
     pretty_algo_name_dict = {
         'conjugate_priors': 'Conjugate Priors',
         'hard_kmeans': 'Hard K-Means',
@@ -211,7 +284,7 @@ def run_ebm(
     
     if algorithm == 'kde':
         final_stage_post = compute_unbiased_stage_likelihoods_kde(
-            n_participants, data_matrix, order_with_highest_ll, final_theta_phi, updated_pi, n_stages, bw_method
+            n_participants, data_matrix, order_with_highest_ll, final_theta_phi, updated_pi, n_stages
         )
     else:
         final_stage_post = compute_unbiased_stage_likelihoods(
@@ -265,6 +338,8 @@ def run_ebm(
         "max_log_likelihood": float(max(log_likelihoods)),
         "kendalls_tau": tau,
         "p_value": p_value,
+        "kendalls_tau2": tau2,
+        "p_value2": p_value2,
         "mean_absolute_error": mae,
         'current_pi': current_pi.tolist(),
         # updated pi is the pi for all stages, including 0

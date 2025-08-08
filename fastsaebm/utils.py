@@ -34,7 +34,6 @@ p3
 """
 
 
-
 from typing import Tuple
 import numpy as np
 from numba import njit
@@ -44,6 +43,130 @@ from .fast_kde import compute_ln_likelihood_kde_fast
 import re 
 import os 
 import logging 
+
+
+@njit(fastmath=False)
+def get_adaptive_weight_threshold(data_size: int) -> float:
+    """Data-size dependent threshold for EM updates"""
+    if data_size >= 1000:
+        return 0.005
+    elif data_size >= 500:
+        return 0.0075
+    elif data_size >= 200:
+        return 0.01
+    elif data_size >= 50:
+        return 0.015
+    else:
+        return 0.02  # For very small datasets
+
+def update_kde_for_biomarker_em(
+    n_participants: int,
+    bm_measurements: np.ndarray,
+    is_diseased: np.ndarray,       # <-- boolean mask
+    stage_post: np.ndarray,
+    theta_phi_current_biomarker: np.ndarray,
+    disease_stages: np.ndarray,
+    curr_order: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Update KDE estimates for a biomarker using EM with adaptive thresholds.
+    
+    Args:
+        bm_measurements: All measurements for this biomarker across all participants
+        stage_post: Stage posteriors
+        theta_phi_current: Current KDE estimates
+        disease_stages: Disease stage values
+        curr_order: Current biomarker order
+        
+    Returns:
+        Updated theta_kde and phi_kde objects
+    """    
+    # Initialize weight arrays; the size of J
+    theta_weights = np.zeros_like(bm_measurements, dtype=np.float64)
+    phi_weights = np.ones_like(bm_measurements, dtype=np.float64)
+
+    # Get adaptive threshold based on data size
+    weight_change_threshold = get_adaptive_weight_threshold(len(bm_measurements))
+
+    # we've made sure the default theta is 0 and default phi is 1
+    # so there is no need to go through non diseased participants
+    # because for non-diseased participants, all weight goes to phi
+
+    # Update weights based on current posterior estimates
+    for p in range(n_participants):
+        if is_diseased[p]:
+            # For diseased participants, distribute weights based on stage
+            probs = stage_post[p]
+            # suppose curr_order = N, i.e., the last bm to get affected
+            # then theta_weights[p] = probs[-1]
+
+            # theta_weights[p]: how likely is this this measurement (this participant, this biomarker) in the affected group
+            theta_weights[p] = np.sum(probs[disease_stages >= curr_order])
+            phi_weights[p] = np.sum(probs[disease_stages < curr_order])
+        else:
+            # healthy → θ=0, φ=1
+            theta_weights[p] = 0.0
+            phi_weights[p] = 1.0
+
+    # Normalize weights
+    theta_sum = np.sum(theta_weights)
+    if theta_sum > 0:
+        theta_weights /= theta_sum
+    else:
+        # Handle edge case with no theta weights
+        theta_weights[:] = 1.0 / len(theta_weights)
+        
+    phi_sum = np.sum(phi_weights)
+    if phi_sum > 0:
+        phi_weights /= phi_sum
+    else:
+        # Handle edge case with no phi weights
+        phi_weights[:] = 1.0 / len(phi_weights)
+
+    # Theta KDE decision - compare new weights with current KDE weights
+    # Access weights directly from the KDE objects
+    current_theta_weights = theta_phi_current_biomarker[1, :]
+    current_phi_weights = theta_phi_current_biomarker[2, :]
+    
+    # Only update KDEs if weights changed significantly
+    if np.mean(np.abs(theta_weights - current_theta_weights)) < weight_change_threshold:
+        theta_weights = current_theta_weights  # Reuse existing weights
+    
+    if np.mean(np.abs(phi_weights - current_phi_weights)) < weight_change_threshold:
+        phi_weights = current_phi_weights  # Reuse existing weights
+    
+    return theta_weights, phi_weights
+
+def update_theta_phi_estimates_kde(
+    n_biomarkers:int,
+    n_participants:int,
+    non_diseased_ids:np.ndarray,
+    data_matrix:np.ndarray,
+    new_order:np.ndarray,
+    theta_phi_current: np.ndarray,  # Current state’s θ/φ
+    stage_likelihoods_posteriors: np.ndarray,
+    disease_stages: np.ndarray,
+) -> np.ndarray:
+    """Update in-place theta and phi params for all biomarkers.
+    """
+    updated_theta_phi = theta_phi_current.copy()
+    is_diseased = np.ones(n_participants, dtype=np.bool_)
+    is_diseased[non_diseased_ids] = False
+    for bm_idx in range(n_biomarkers):
+        curr_order = new_order[bm_idx]
+        bm_measurements = data_matrix[:,bm_idx]
+        # shape: (3 * n_participants)
+        theta_phi_current_biomarker = theta_phi_current[bm_idx]
+        updated_theta_phi[bm_idx, 1], updated_theta_phi[bm_idx, 2] = update_kde_for_biomarker_em(
+            n_participants,
+            bm_measurements,
+            is_diseased,
+            stage_likelihoods_posteriors,
+            theta_phi_current_biomarker,
+            disease_stages,
+            curr_order,
+        )    
+    return updated_theta_phi
 
 def get_two_clusters_with_kmeans(
     bm_measurements: np.ndarray,
@@ -134,8 +257,7 @@ def get_initial_kde_estimates(
     """
     Obtain initial KDE estimates for each biomarker.
     """
-    N = data_matrix.shape[1]  # number of biomarkers
-    J = data_matrix.shape[0]  # number of participants
+    J, N = data_matrix.shape  # number of participants, number of biomarkers
     # Each row: biomarker; 3 columns: data, theta_weights, phi_weights
     estimates = np.zeros((N, 3, J))
 
@@ -150,15 +272,19 @@ def get_initial_kde_estimates(
         
         # Normalize weights
         theta_weights = is_theta
+        # for non_diseased participants, their theta must be 0 
+        theta_weights[non_diseased_ids] = 0.0
         theta_sum = np.sum(theta_weights)
         if theta_sum > 0:
             theta_weights /= theta_sum
-            
+        
         phi_weights = 1 - is_theta
+        # for non_diseased participants, their phi must be 1 
+        theta_weights[non_diseased_ids] = 1.0
         phi_sum = np.sum(phi_weights)
         if phi_sum > 0:
             phi_weights /= phi_sum
-
+        
         estimates[bm, 0] = bm_measurements
         estimates[bm, 1] = theta_weights
         estimates[bm, 2] = phi_weights
@@ -202,7 +328,7 @@ def get_initial_theta_phi_estimates(
         estimates[bm] = np.array([theta_mean, theta_std, phi_mean, phi_std])
     return estimates
 
-@njit
+@njit(fastmath=False)
 def update_theta_phi_biomarker_em(
     bm_measurements: np.ndarray, # this biomarker's measurements, J-length vector
     n_participants:int,
@@ -244,7 +370,7 @@ def update_theta_phi_biomarker_em(
         np.sum(resp_nonaffected*(bm_measurements - phi_mean)**2) / sum_nonaffected)
     return theta_mean, theta_std, phi_mean, phi_std
 
-@njit
+@njit(fastmath=False)
 def compute_theta_phi_biomarker_conjugate_priors(
     affected_cluster: np.ndarray,
     non_affected_cluster: np.ndarray,
@@ -297,7 +423,7 @@ def compute_theta_phi_biomarker_conjugate_priors(
         )
     return theta_mean, theta_std, phi_mean, phi_std
 
-@njit
+@njit(fastmath=False)
 def estimate_params_exact(
     m0: float,
     n0: float,
@@ -347,7 +473,7 @@ def estimate_params_exact(
 
     return mu_estimation, std_estimation
 
-@ njit
+@njit(fastmath=False)
 def obtain_affected_and_non_clusters(
     bm_measurements:np.ndarray,
     n_participants:int,
@@ -393,128 +519,7 @@ def obtain_affected_and_non_clusters(
                         non_affected_cluster.append(m)
     return np.array(affected_cluster), np.array(non_affected_cluster)
 
-
-@njit(fastmath=True)
-def get_adaptive_weight_threshold(data_size: int) -> float:
-    """Data-size dependent threshold for EM updates"""
-    if data_size >= 1000:
-        return 0.005
-    elif data_size >= 500:
-        return 0.0075
-    elif data_size >= 200:
-        return 0.01
-    elif data_size >= 50:
-        return 0.015
-    else:
-        return 0.02  # For very small datasets
-
-@njit(fastmath=True)
-def update_kde_for_biomarker_em(
-    n_participants: int,
-    bm_measurements: np.ndarray,
-    non_diseased_ids: np.ndarray,
-    stage_post: np.ndarray,
-    theta_phi_current_biomarker: np.ndarray,
-    disease_stages: np.ndarray,
-    curr_order: int,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Update KDE estimates for a biomarker using EM with adaptive thresholds.
-    
-    Args:
-        bm_measurements: All measurements for this biomarker across all participants
-        stage_post: Stage posteriors
-        theta_phi_current: Current KDE estimates
-        disease_stages: Disease stage values
-        curr_order: Current biomarker order
-        
-    Returns:
-        Updated theta_kde and phi_kde objects
-    """
-    data_size = len(bm_measurements)
-    
-    # Initialize weight arrays; the size of J
-    theta_weights = np.zeros_like(bm_measurements, dtype=np.float64)
-    phi_weights = np.zeros_like(bm_measurements, dtype=np.float64)
-
-    # Get adaptive threshold based on data size
-    weight_change_threshold = get_adaptive_weight_threshold(data_size)
-
-    # Update weights based on current posterior estimates
-    for p in range(n_participants):
-        if p in non_diseased_ids:
-            # For non-diseased participants, all weight goes to phi
-            phi_weights[p] = 1.0
-            theta_weights[p] = 0.0
-        else:
-            # For diseased participants, distribute weights based on stage
-            probs = stage_post[p]
-            theta_weights[p] = np.sum(probs[disease_stages >= curr_order])
-            phi_weights[p] = np.sum(probs[disease_stages < curr_order])
-
-    # Normalize weights
-    theta_sum = np.sum(theta_weights)
-    if theta_sum > 0:
-        theta_weights /= theta_sum
-    else:
-        # Handle edge case with no theta weights
-        theta_weights = np.ones_like(theta_weights) / len(theta_weights)
-        
-    phi_sum = np.sum(phi_weights)
-    if phi_sum > 0:
-        phi_weights /= phi_sum
-    else:
-        # Handle edge case with no phi weights
-        phi_weights = np.ones_like(phi_weights) / len(phi_weights)
-
-    # Theta KDE decision - compare new weights with current KDE weights
-    # Access weights directly from the KDE objects
-    current_theta_weights = theta_phi_current_biomarker[1, :]
-    current_phi_weights = theta_phi_current_biomarker[2, :]
-    
-    # Only update KDEs if weights changed significantly
-    if np.mean(np.abs(theta_weights - current_theta_weights)) < weight_change_threshold:
-        assert len(theta_weights) == len(current_theta_weights), "old and new theta weights are not of the same length"
-        theta_weights[:] = current_theta_weights  # Reuse existing weights
-    
-    if np.mean(np.abs(phi_weights - current_phi_weights)) < weight_change_threshold:
-        assert len(phi_weights) == len(current_phi_weights), "old and new phi weights are not of the same length"
-        phi_weights[:] = current_phi_weights  # Reuse existing weights
-    
-    assert np.isclose(np.sum(theta_weights), 1.0, atol=1e-8) and np.isclose(np.sum(phi_weights), 1.0, atol=1e-8), "weights sum is not 1!"
-    return theta_weights, phi_weights
-
-@njit
-def update_theta_phi_estimates_kde(
-    n_biomarkers:int,
-    n_participants:int,
-    non_diseased_ids:np.ndarray,
-    data_matrix:np.ndarray,
-    new_order:np.ndarray,
-    theta_phi_current: np.ndarray,  # Current state’s θ/φ
-    stage_likelihoods_posteriors: np.ndarray,
-    disease_stages: np.ndarray,
-) -> np.ndarray:
-    """Update in-place theta and phi params for all biomarkers.
-    """
-    updated_theta_phi = theta_phi_current.copy()
-    for bm_idx in range(n_biomarkers):
-        curr_order = new_order[bm_idx]
-        bm_measurements = data_matrix[:,bm_idx]
-        # shape: (3 * n_participants)
-        theta_phi_current_biomarker = theta_phi_current[bm_idx]
-        updated_theta_phi[bm_idx, 1], updated_theta_phi[bm_idx, 2] = update_kde_for_biomarker_em(
-            n_participants,
-            bm_measurements,
-            non_diseased_ids,
-            stage_likelihoods_posteriors,
-            theta_phi_current_biomarker,
-            disease_stages,
-            curr_order,
-        )    
-    return updated_theta_phi
-
-@njit
+@njit(fastmath=False)
 def update_theta_phi_biomarker_mle(
     affected_cluster: np.ndarray,
     non_affected_cluster: np.ndarray,
@@ -557,7 +562,7 @@ def update_theta_phi_biomarker_mle(
     
     return theta_mean, theta_std, phi_mean, phi_std
 
-@njit
+@njit(fastmath=False)
 def update_theta_phi_estimates(
     algorithm:str,
     n_biomarkers:int,
@@ -603,7 +608,7 @@ def update_theta_phi_estimates(
                     affected_cluster, non_affected_cluster, theta_phi_current_biomarker)     
     return updated_params
 
-@njit
+@njit(fastmath=False)
 def compute_total_ln_likelihood_and_stage_likelihoods(
     n_participants:int,
     data_matrix:np.ndarray,
@@ -629,16 +634,14 @@ def compute_total_ln_likelihood_and_stage_likelihoods(
             # Diseased participant (sum over possible stages)
             # ln_stage_likelihoods: N length vector
             ln_stage_likelihoods = np.zeros(len(disease_stages))
-            for i, k_j in enumerate(disease_stages):
-                ln_stage_likelihoods[i] = compute_ln_likelihood(
+            for idx, k_j in enumerate(disease_stages):
+                ln_stage_likelihoods[idx] = compute_ln_likelihood(
                     measurements, new_order, k_j=k_j, theta_phi=theta_phi
-                ) + np.log(current_pi[k_j - 1])
+                ) + np.log(current_pi[idx])
             # Use log-sum-exp trick for numerical stability
             max_ln_likelihood = np.max(ln_stage_likelihoods)
-            stage_likelihoods = np.exp(
-                ln_stage_likelihoods - max_ln_likelihood)
+            stage_likelihoods = np.exp(ln_stage_likelihoods - max_ln_likelihood)
             likelihood_sum = np.sum(stage_likelihoods)
-            # Proof: https://hongtaoh.com/en/2024/12/14/log-sum-exp/
             ln_likelihood = max_ln_likelihood + np.log(likelihood_sum)
             
             stage_likelihoods_posteriors[participant] = stage_likelihoods/likelihood_sum
@@ -646,8 +649,6 @@ def compute_total_ln_likelihood_and_stage_likelihoods(
         total_ln_likelihood += ln_likelihood
     return total_ln_likelihood, stage_likelihoods_posteriors
 
-
-@njit
 def compute_total_ln_likelihood_and_stage_likelihoods_kde(
     n_participants:int,
     data_matrix:np.ndarray,
@@ -656,7 +657,6 @@ def compute_total_ln_likelihood_and_stage_likelihoods_kde(
     theta_phi: np.ndarray,
     current_pi: np.ndarray,
     disease_stages: np.ndarray,
-    bw_method:str
 ) -> Tuple[float, np.ndarray]:
     """Calculate the total log likelihood across all participants
         and obtain stage_likelihoods_posteriors
@@ -666,39 +666,34 @@ def compute_total_ln_likelihood_and_stage_likelihoods_kde(
     stage_likelihoods_posteriors = np.zeros((n_participants, len(disease_stages)))
 
     for participant in range(n_participants):
-        measurements = data_matrix[participant]
+        p_measurements = data_matrix[participant]
         if participant in non_diseased_ids:
             ln_likelihood = compute_ln_likelihood_kde_fast(
                 n_participants=n_participants,
-                p_measurements=measurements, # all bm measurements for a specific individual
+                p_measurements=p_measurements, # all bm measurements for a specific individual
                 S_n=new_order, # the new_order, 1-index, which is the index for bm1 to bmN
                 k_j=0, 
                 kde_theta_phi=theta_phi,
-                bw_method=bw_method
             )
            
         else:
             # Diseased participant (sum over possible stages)
             # ln_stage_likelihoods: N length vector
             ln_stage_likelihoods = np.zeros(len(disease_stages))
-            for i, k_j in enumerate(disease_stages):
-                ln_stage_likelihoods[i] = compute_ln_likelihood_kde_fast(
+            for idx, k_j in enumerate(disease_stages):
+                ln_stage_likelihoods[idx] = compute_ln_likelihood_kde_fast(
                     n_participants=n_participants,
-                    p_measurements=measurements, # all bm measurements for a specific individual
+                    p_measurements=p_measurements, # all bm measurements for a specific individual
                     S_n=new_order, # the new_order, 1-index, which is the index for bm1 to bmN
                     k_j=k_j, 
                     kde_theta_phi=theta_phi,
-                    bw_method=bw_method
-                ) + np.log(current_pi[k_j - 1])
+                ) + np.log(current_pi[idx])
           
             # Use log-sum-exp trick for numerical stability
             max_ln_likelihood = np.max(ln_stage_likelihoods)
-            stage_likelihoods = np.exp(
-                ln_stage_likelihoods - max_ln_likelihood)
+            stage_likelihoods = np.exp(ln_stage_likelihoods - max_ln_likelihood)
             likelihood_sum = np.sum(stage_likelihoods)
-            # Proof: https://hongtaoh.com/en/2024/12/14/log-sum-exp/
             ln_likelihood = max_ln_likelihood + np.log(likelihood_sum)
-            
             stage_likelihoods_posteriors[participant] = stage_likelihoods/likelihood_sum
 
         total_ln_likelihood += ln_likelihood
@@ -843,7 +838,7 @@ def cleanup_old_files(output_dir: str, fname: str):
         else:
             logging.warning(f"File does not exist, skipping removal: {file_path}")
 
-@njit
+@njit(fastmath=False)
 def compute_unbiased_stage_likelihoods(
     n_participants:int,
     data_matrix:np.ndarray,
@@ -874,7 +869,7 @@ def compute_unbiased_stage_likelihoods(
 
     return stage_likelihoods_posteriors
 
-@njit
+@njit(fastmath=False)
 def compute_unbiased_stage_likelihoods_kde(
     n_participants:int,
     data_matrix:np.ndarray,
@@ -882,7 +877,6 @@ def compute_unbiased_stage_likelihoods_kde(
     theta_phi: np.ndarray,
     updated_pi: np.ndarray,
     n_stages:int,
-    bw_method:str
 ) -> np.ndarray:
     """Calculate the total log likelihood across all participants
         and obtain stage_likelihoods_posteriors
@@ -900,7 +894,6 @@ def compute_unbiased_stage_likelihoods_kde(
                 S_n=new_order, # the new_order, 1-index, which is the index for bm1 to bmN
                 k_j=k_j, 
                 kde_theta_phi=theta_phi,
-                bw_method=bw_method
             ) + np.log(updated_pi[k_j])
         
         # Use log-sum-exp trick for numerical stability
